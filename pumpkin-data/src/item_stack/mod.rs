@@ -1,15 +1,16 @@
 use crate::data_component::DataComponent;
 use crate::data_component::DataComponent::Enchantments;
 use crate::data_component_impl::{
-    BlocksAttacksImpl, ConsumableImpl, DamageImpl, DataComponentImpl, EnchantmentsImpl, IDSet,
-    MaxDamageImpl, MaxStackSizeImpl, ToolImpl, UnbreakableImpl, UseCooldownImpl, get, get_mut,
-    read_data,
+    BlocksAttacksImpl, ConsumableImpl, CustomDataImpl, DamageImpl, DataComponentImpl,
+    EnchantmentsImpl, IDSet, MaxDamageImpl, MaxStackSizeImpl, ToolImpl, UnbreakableImpl,
+    UseCooldownImpl, get, get_mut, read_data,
 };
 use crate::item::Item;
 use crate::recipes::RecipeResultStruct;
 use crate::tag::Taggable;
 use crate::{Block, Enchantment};
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::tag::NbtTag;
 use pumpkin_util::GameMode;
 use rand;
 use std::borrow::Cow;
@@ -412,6 +413,119 @@ impl ItemStack {
         }
     }
 
+    fn custom_data_compound(&self) -> Option<&NbtCompound> {
+        self.get_data_component::<CustomDataImpl>()
+            .map(|custom_data| &custom_data.data)
+    }
+
+    fn set_custom_data_tag(&mut self, namespace: &str, key: &str, value: NbtTag) {
+        let mut custom_data = self
+            .get_data_component::<CustomDataImpl>()
+            .map_or_else(NbtCompound::new, |custom_data| custom_data.data.clone());
+
+        let mut namespace_data = custom_data
+            .child_tags
+            .remove(namespace)
+            .and_then(|tag| match tag {
+                NbtTag::Compound(compound) => Some(compound),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        namespace_data.child_tags.insert(key.into(), value);
+        custom_data
+            .child_tags
+            .insert(namespace.into(), NbtTag::Compound(namespace_data));
+
+        self.set_custom_data_component(custom_data);
+    }
+
+    fn set_custom_data_component(&mut self, custom_data: NbtCompound) {
+        let component = Some(CustomDataImpl { data: custom_data }.to_dyn());
+        if let Some((_, data)) = self
+            .patch
+            .iter_mut()
+            .find(|(id, _)| *id == DataComponent::CustomData)
+        {
+            *data = component;
+        } else {
+            self.patch.push((DataComponent::CustomData, component));
+        }
+    }
+
+    fn get_custom_data_tag(&self, namespace: &str, key: &str) -> Option<&NbtTag> {
+        self.custom_data_compound()?
+            .get(namespace)?
+            .extract_compound()?
+            .get(key)
+    }
+
+    pub fn set_custom_data_bool(&mut self, namespace: &str, key: &str, value: bool) {
+        self.set_custom_data_tag(namespace, key, NbtTag::Byte(i8::from(value)));
+    }
+
+    #[must_use]
+    pub fn get_custom_data_bool(&self, namespace: &str, key: &str) -> Option<bool> {
+        self.get_custom_data_tag(namespace, key)
+            .and_then(NbtTag::extract_bool)
+    }
+
+    pub fn set_custom_data_string(&mut self, namespace: &str, key: &str, value: String) {
+        self.set_custom_data_tag(namespace, key, NbtTag::String(value.into()));
+    }
+
+    #[must_use]
+    pub fn get_custom_data_string(&self, namespace: &str, key: &str) -> Option<String> {
+        self.get_custom_data_tag(namespace, key)
+            .and_then(NbtTag::extract_string)
+            .map(str::to_owned)
+    }
+
+    pub fn set_custom_data_bytes(&mut self, namespace: &str, key: &str, value: Vec<u8>) {
+        let bytes = value.into_iter().map(|byte| byte as i8).collect::<Vec<_>>();
+        self.set_custom_data_tag(namespace, key, NbtTag::ByteArray(bytes.into()));
+    }
+
+    #[must_use]
+    pub fn get_custom_data_bytes(&self, namespace: &str, key: &str) -> Option<Vec<u8>> {
+        self.get_custom_data_tag(namespace, key)
+            .and_then(NbtTag::extract_byte_array)
+            .map(|bytes| bytes.iter().map(|byte| *byte as u8).collect())
+    }
+
+    pub fn remove_custom_data(&mut self, namespace: &str, key: &str) {
+        let Some(mut custom_data) = self
+            .get_data_component::<CustomDataImpl>()
+            .map(|custom_data| custom_data.data.clone())
+        else {
+            return;
+        };
+
+        let Some(NbtTag::Compound(mut namespace_data)) = custom_data.child_tags.remove(namespace)
+        else {
+            return;
+        };
+
+        namespace_data.child_tags.remove(key);
+        if !namespace_data.is_empty() {
+            custom_data
+                .child_tags
+                .insert(namespace.into(), NbtTag::Compound(namespace_data));
+        }
+
+        if custom_data.is_empty() {
+            self.patch
+                .retain(|(id, _)| *id != DataComponent::CustomData);
+        } else {
+            self.set_custom_data_component(custom_data);
+        }
+    }
+
+    #[must_use]
+    pub fn has_custom_data(&self, namespace: &str, key: &str) -> bool {
+        self.get_custom_data_tag(namespace, key).is_some()
+    }
+
     #[must_use]
     pub fn split(&mut self, amount: u8) -> Self {
         let min = amount.min(self.item_count);
@@ -654,11 +768,135 @@ impl From<&RecipeResultStruct> for ItemStack {
 mod tests {
     use super::*;
     use crate::data_component::DataComponent;
-    use crate::data_component_impl::{DataComponentImpl, EnchantmentsImpl, UnbreakableImpl};
+    use crate::data_component_impl::{
+        CustomDataImpl, CustomNameImpl, DataComponentImpl, EnchantmentsImpl, UnbreakableImpl,
+    };
 
     /// Helper: creates a fresh Iron Sword (max_damage 250, damage 0).
     fn iron_sword() -> ItemStack {
         ItemStack::new(1, &Item::IRON_SWORD)
+    }
+
+    #[test]
+    fn custom_data_sets_and_reads_typed_values() {
+        let mut stack = ItemStack::new(1, &Item::WOODEN_AXE);
+
+        stack.set_custom_data_bool("worldpumpkin", "wand", true);
+        stack.set_custom_data_string("worldpumpkin", "mode", "pos1".to_string());
+        stack.set_custom_data_bytes("worldpumpkin", "payload", vec![0, 1, 127, 128, 255]);
+
+        assert_eq!(
+            stack.get_custom_data_bool("worldpumpkin", "wand"),
+            Some(true)
+        );
+        assert_eq!(
+            stack.get_custom_data_string("worldpumpkin", "mode"),
+            Some("pos1".to_string())
+        );
+        assert_eq!(
+            stack.get_custom_data_bytes("worldpumpkin", "payload"),
+            Some(vec![0, 1, 127, 128, 255])
+        );
+        assert!(stack.has_custom_data("worldpumpkin", "wand"));
+    }
+
+    #[test]
+    fn custom_data_preserves_sibling_namespaces_and_keys() {
+        let mut stack = ItemStack::new(1, &Item::WOODEN_AXE);
+
+        stack.set_custom_data_bool("worldpumpkin", "wand", true);
+        stack.set_custom_data_string("worldpumpkin", "mode", "pos1".to_string());
+        stack.set_custom_data_bool("other_plugin", "marked", true);
+        stack.set_custom_data_bool("worldpumpkin", "wand", false);
+
+        assert_eq!(
+            stack.get_custom_data_bool("worldpumpkin", "wand"),
+            Some(false)
+        );
+        assert_eq!(
+            stack.get_custom_data_string("worldpumpkin", "mode"),
+            Some("pos1".to_string())
+        );
+        assert_eq!(
+            stack.get_custom_data_bool("other_plugin", "marked"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn remove_custom_data_removes_only_target_key_and_cleans_empty_component() {
+        let mut stack = ItemStack::new(1, &Item::WOODEN_AXE);
+
+        stack.set_custom_data_bool("worldpumpkin", "wand", true);
+        stack.set_custom_data_string("worldpumpkin", "mode", "pos1".to_string());
+        stack.set_custom_data_bool("other_plugin", "marked", true);
+
+        stack.remove_custom_data("worldpumpkin", "wand");
+        assert!(!stack.has_custom_data("worldpumpkin", "wand"));
+        assert_eq!(
+            stack.get_custom_data_string("worldpumpkin", "mode"),
+            Some("pos1".to_string())
+        );
+        assert_eq!(
+            stack.get_custom_data_bool("other_plugin", "marked"),
+            Some(true)
+        );
+        assert!(stack.get_data_component::<CustomDataImpl>().is_some());
+
+        stack.remove_custom_data("worldpumpkin", "mode");
+        stack.remove_custom_data("other_plugin", "marked");
+        assert!(stack.get_data_component::<CustomDataImpl>().is_none());
+    }
+
+    #[test]
+    fn custom_data_preserves_other_item_components() {
+        let mut stack = ItemStack::new(1, &Item::WOODEN_AXE);
+        stack.patch.push((
+            DataComponent::CustomName,
+            Some(
+                CustomNameImpl {
+                    name: pumpkin_util::text::TextComponent::text("Selection Wand"),
+                }
+                .to_dyn(),
+            ),
+        ));
+        stack
+            .patch
+            .push((DataComponent::Unbreakable, Some(UnbreakableImpl.to_dyn())));
+
+        stack.set_custom_data_bool("worldpumpkin", "wand", true);
+        stack.remove_custom_data("worldpumpkin", "missing");
+
+        assert!(stack.get_data_component::<CustomNameImpl>().is_some());
+        assert!(stack.get_data_component::<UnbreakableImpl>().is_some());
+        assert_eq!(
+            stack.get_custom_data_bool("worldpumpkin", "wand"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn custom_data_survives_item_stack_nbt_roundtrip() {
+        let mut stack = ItemStack::new(1, &Item::WOODEN_AXE);
+        stack.set_custom_data_bool("worldpumpkin", "wand", true);
+        stack.set_custom_data_string("worldpumpkin", "mode", "pos1".to_string());
+        stack
+            .patch
+            .push((DataComponent::Unbreakable, Some(UnbreakableImpl.to_dyn())));
+
+        let mut compound = NbtCompound::new();
+        stack.write_item_stack(&mut compound);
+        let decoded = ItemStack::read_item_stack(&compound).expect("stack should decode");
+
+        assert_eq!(
+            decoded.get_custom_data_bool("worldpumpkin", "wand"),
+            Some(true)
+        );
+        assert_eq!(
+            decoded.get_custom_data_string("worldpumpkin", "mode"),
+            Some("pos1".to_string())
+        );
+        assert!(decoded.get_data_component::<UnbreakableImpl>().is_some());
     }
 
     // ── damage_item ───────────────────────────────────────────────
